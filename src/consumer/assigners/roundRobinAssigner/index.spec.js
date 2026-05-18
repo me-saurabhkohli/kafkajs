@@ -133,6 +133,106 @@ describe('Consumer > assigners > RoundRobinAssigner', () => {
       ])
     })
 
+    test('falls back safely when member metadata decode fails', async () => {
+      metadata['topic-A'] = Array(2)
+        .fill()
+        .map((_, i) => ({ partitionId: i }))
+      metadata['topic-B'] = Array(2)
+        .fill()
+        .map((_, i) => ({ partitionId: i }))
+
+      const members = [
+        { memberId: 'member-1', memberMetadata: Buffer.from('invalid-metadata') },
+        {
+          memberId: 'member-2',
+          memberMetadata: MemberMetadata.encode({
+            version: assigner.version,
+            topics: ['topic-B'],
+          }),
+        },
+      ]
+
+      const assignment = await assigner.assign({
+        members,
+        topics: ['topic-A', 'topic-B'],
+      })
+
+      expect(assignment).toEqual([
+        {
+          memberId: 'member-1',
+          memberAssignment: MemberAssignment.encode({
+            version: assigner.version,
+            assignment: {
+              'topic-A': [0, 1],
+              'topic-B': [0],
+            },
+          }),
+        },
+        {
+          memberId: 'member-2',
+          memberAssignment: MemberAssignment.encode({
+            version: assigner.version,
+            assignment: {
+              'topic-B': [1],
+            },
+          }),
+        },
+      ])
+    })
+
+    test('rolling deployment regression: v1[A] + v2[A,B] keeps B assignable', async () => {
+      metadata['topic-A'] = Array(2)
+        .fill()
+        .map((_, i) => ({ partitionId: i }))
+      metadata['topic-B'] = Array(3)
+        .fill()
+        .map((_, i) => ({ partitionId: i }))
+
+      const members = [
+        {
+          memberId: 'old-v1',
+          memberMetadata: MemberMetadata.encode({
+            version: assigner.version,
+            topics: ['topic-A'],
+          }),
+        },
+        {
+          memberId: 'new-v2',
+          memberMetadata: MemberMetadata.encode({
+            version: assigner.version,
+            topics: ['topic-A', 'topic-B'],
+          }),
+        },
+      ]
+
+      const assignment = await assigner.assign({
+        members,
+        topics: ['topic-A', 'topic-B'],
+      })
+
+      expect(assignment).toEqual([
+        {
+          memberId: 'new-v2',
+          memberAssignment: MemberAssignment.encode({
+            version: assigner.version,
+            assignment: {
+              'topic-A': [0],
+              'topic-B': [0, 1, 2],
+            },
+          }),
+        },
+        {
+          memberId: 'old-v1',
+          memberAssignment: MemberAssignment.encode({
+            version: assigner.version,
+            assignment: {
+              'topic-A': [1],
+            },
+          }),
+        },
+      ])
+    })
+
     test('assign topics with names taken from builtin functions', async () => {
       topics = ['shift', 'toString']
       metadata['shift'] = [{ partitionId: 0 }]
