@@ -37,6 +37,8 @@ const PRIVATE = {
   SHARED_HEARTBEAT: Symbol('private:ConsumerGroup:sharedHeartbeat'),
 }
 
+const MAX_COOPERATIVE_REJOIN_ROUNDS = 20
+
 module.exports = class ConsumerGroup {
   /**
    * @param {object} options
@@ -113,6 +115,8 @@ module.exports = class ConsumerGroup {
     this.memberId = null
     this.members = null
     this.groupProtocol = null
+    this.needsCooperativeRejoin = false
+    this.cooperativeRejoinRequestedBy = []
 
     this.partitionsPerSubscribedTopic = null
     /**
@@ -327,6 +331,26 @@ module.exports = class ConsumerGroup {
 
     this.topics = currentMemberAssignment.map(({ topic }) => topic)
     this.subscriptionState.assign(currentMemberAssignment)
+
+    // Notify stateful assigners (e.g. cooperative sticky) about successful
+    // assignment so they can persist owned partitions in protocol userData.
+    const assignmentMap = currentMemberAssignment.reduce(
+      (acc, { topic, partitions }) => ({ ...acc, [topic]: partitions }),
+      {}
+    )
+    for (const assigner of this.assigners) {
+      if (typeof assigner.onAssignment === 'function') {
+        const shouldRejoin = assigner.onAssignment({
+          assignment: assignmentMap,
+          generationId: this.generationId,
+        })
+        if (shouldRejoin) {
+          this.needsCooperativeRejoin = true
+          this.cooperativeRejoinRequestedBy.push(assigner.name || 'unknown-assigner')
+        }
+      }
+    }
+
     this.offsetManager = new OffsetManager({
       cluster: this.cluster,
       topicConfigurations: this.topicConfigurations,
@@ -351,42 +375,84 @@ module.exports = class ConsumerGroup {
   joinAndSync() {
     const startJoin = Date.now()
     return this.retrier(async bail => {
-      try {
-        await this[PRIVATE.JOIN]()
-        await this[PRIVATE.SYNC]()
+      let cooperativeRejoinRound = 0
 
-        const memberAssignment = this.assigned().reduce(
-          (result, { topic, partitions }) => ({ ...result, [topic]: partitions }),
-          {}
-        )
+      while (true) {
+        cooperativeRejoinRound += 1
 
-        const payload = {
+        if (cooperativeRejoinRound > MAX_COOPERATIVE_REJOIN_ROUNDS) {
+          const error = new KafkaJSNonRetriableError(
+            `Exceeded maximum cooperative rejoin rounds (${MAX_COOPERATIVE_REJOIN_ROUNDS})`
+          )
+
+          this.logger.error('Exceeded cooperative rejoin round limit', {
+            groupId: this.groupId,
+            memberId: this.memberId,
+            leaderId: this.leaderId,
+            groupProtocol: this.groupProtocol,
+            cooperativeRejoinRound,
+            maxCooperativeRejoinRounds: MAX_COOPERATIVE_REJOIN_ROUNDS,
+            requestedBy: this.cooperativeRejoinRequestedBy,
+          })
+
+          bail(error)
+          return
+        }
+
+        try {
+          this.needsCooperativeRejoin = false
+          this.cooperativeRejoinRequestedBy = []
+          await this[PRIVATE.JOIN]()
+          await this[PRIVATE.SYNC]()
+
+          const memberAssignment = this.assigned().reduce(
+            (result, { topic, partitions }) => ({ ...result, [topic]: partitions }),
+            {}
+          )
+
+          const payload = {
+            groupId: this.groupId,
+            memberId: this.memberId,
+            leaderId: this.leaderId,
+            isLeader: this.isLeader(),
+            memberAssignment,
+            groupProtocol: this.groupProtocol,
+            duration: Date.now() - startJoin,
+          }
+
+          this.instrumentationEmitter.emit(GROUP_JOIN, payload)
+          this.logger.info('Consumer has joined the group', payload)
+        } catch (e) {
+          if (isRebalancing(e)) {
+            // Rebalance in progress isn't a retriable protocol error since the consumer
+            // has to go through find coordinator and join again before it can
+            // actually retry the operation. We wrap the original error in a retriable error
+            // here instead in order to restart the join + sync sequence using the retrier.
+            throw new KafkaJSError(e)
+          }
+
+          if (e.type === 'UNKNOWN_MEMBER_ID') {
+            this.memberId = null
+            throw new KafkaJSError(e)
+          }
+
+          bail(e)
+          return
+        }
+
+        if (!this.needsCooperativeRejoin) {
+          break
+        }
+
+        this.logger.warn('Cooperative assigner requested additional join/sync round', {
           groupId: this.groupId,
           memberId: this.memberId,
           leaderId: this.leaderId,
-          isLeader: this.isLeader(),
-          memberAssignment,
           groupProtocol: this.groupProtocol,
-          duration: Date.now() - startJoin,
-        }
-
-        this.instrumentationEmitter.emit(GROUP_JOIN, payload)
-        this.logger.info('Consumer has joined the group', payload)
-      } catch (e) {
-        if (isRebalancing(e)) {
-          // Rebalance in progress isn't a retriable protocol error since the consumer
-          // has to go through find coordinator and join again before it can
-          // actually retry the operation. We wrap the original error in a retriable error
-          // here instead in order to restart the join + sync sequence using the retrier.
-          throw new KafkaJSError(e)
-        }
-
-        if (e.type === 'UNKNOWN_MEMBER_ID') {
-          this.memberId = null
-          throw new KafkaJSError(e)
-        }
-
-        bail(e)
+          cooperativeRejoinRound,
+          maxCooperativeRejoinRounds: MAX_COOPERATIVE_REJOIN_ROUNDS,
+          requestedBy: this.cooperativeRejoinRequestedBy,
+        })
       }
     })
   }
