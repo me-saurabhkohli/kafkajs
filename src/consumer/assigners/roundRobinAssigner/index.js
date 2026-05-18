@@ -40,7 +40,15 @@ module.exports = ({ cluster }) => ({
     const sortedMembers = members.map(({ memberId }) => memberId).sort()
     const assignment = {}
 
-    // Decode per-member topic subscriptions from member metadata
+    // NOTE:
+    // Eligibility is topic-scoped (not partition-scoped).
+    // MemberMetadata carries subscribed topics only, so we:
+    //   1) build eligible members per topic
+    //   2) distribute that topic's partitions across only those members
+    // This keeps mixed-subscription rollouts stable (e.g. v1[A] + v2[A,B]).
+
+    // Decode per-member topic subscriptions from member metadata.
+    // If decode fails, fallback remains intentionally safe/non-throwing.
     const memberSubscriptions = {}
     for (const { memberId, memberMetadata } of members) {
       if (memberMetadata) {
@@ -57,6 +65,7 @@ module.exports = ({ cluster }) => ({
     }
 
     for (const topic of topics) {
+      // Topic-level filter: this is the correct abstraction for assigner eligibility.
       const eligibleMembers = sortedMembers.filter(memberId =>
         memberSubscriptions[memberId].includes(topic)
       )
@@ -65,6 +74,8 @@ module.exports = ({ cluster }) => ({
 
       const partitionMetadata = cluster.findTopicPartitionMetadata(topic)
       partitionMetadata.forEach((m, i) => {
+        // Round-robin partitions within the already-eligible member set.
+        // No additional partition-level subscription checks are expected here.
         const assignee = eligibleMembers[i % eligibleMembers.length]
 
         if (!assignment[assignee]) {
