@@ -36,7 +36,8 @@ module.exports = ({ cluster }) => ({
    *                     }
    *                   ]
    */
-  async assign({ members, topics }) {
+  async assign({ members, topics, allSubscribedTopics }) {
+    const assignableTopics = allSubscribedTopics || topics
     const sortedMembers = members.map(({ memberId }) => memberId).sort()
     const assignment = {}
 
@@ -61,10 +62,10 @@ module.exports = ({ cluster }) => ({
         } catch (e) {}
       }
       // Fallback: member is treated as subscribed to all topics
-      memberSubscriptions[memberId] = topics
+      memberSubscriptions[memberId] = assignableTopics
     }
 
-    for (const topic of topics) {
+    for (const topic of assignableTopics) {
       // Topic-level filter: this is the correct abstraction for assigner eligibility.
       const eligibleMembers = sortedMembers.filter(memberId =>
         memberSubscriptions[memberId].includes(topic)

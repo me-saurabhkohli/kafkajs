@@ -231,6 +231,65 @@ describe('Consumer > assigners > RoundRobinAssigner', () => {
           }),
         },
       ])
+
+      const byMember = assignment.reduce((acc, { memberId, memberAssignment }) => {
+        acc[memberId] = MemberAssignment.decode(memberAssignment).assignment
+        return acc
+      }, {})
+
+      expect(new Set(byMember['new-v2']['topic-B'])).toEqual(new Set([0, 1, 2]))
+      expect(byMember['old-v1']['topic-B']).toBeUndefined()
+
+      const seen = new Set()
+      for (const { memberAssignment } of assignment) {
+        const decoded = MemberAssignment.decode(memberAssignment).assignment
+        for (const [topic, partitions] of Object.entries(decoded)) {
+          for (const partition of partitions) {
+            const key = `${topic}:${partition}`
+            expect(seen.has(key)).toBe(false)
+            seen.add(key)
+          }
+        }
+      }
+      expect(seen).toEqual(
+        new Set(['topic-A:0', 'topic-A:1', 'topic-B:0', 'topic-B:1', 'topic-B:2'])
+      )
+    })
+
+    test('documents topic-scoped round-robin contract', async () => {
+      metadata['topic-A'] = Array(4)
+        .fill()
+        .map((_, i) => ({ partitionId: i }))
+      metadata['topic-B'] = Array(4)
+        .fill()
+        .map((_, i) => ({ partitionId: i }))
+
+      const members = [{ memberId: 'member-1' }, { memberId: 'member-2' }]
+
+      const assignment = await assigner.assign({ members, topics: ['topic-A', 'topic-B'] })
+
+      expect(assignment).toEqual([
+        {
+          memberId: 'member-1',
+          memberAssignment: MemberAssignment.encode({
+            version: assigner.version,
+            assignment: {
+              'topic-A': [0, 2],
+              'topic-B': [0, 2],
+            },
+          }),
+        },
+        {
+          memberId: 'member-2',
+          memberAssignment: MemberAssignment.encode({
+            version: assigner.version,
+            assignment: {
+              'topic-A': [1, 3],
+              'topic-B': [1, 3],
+            },
+          }),
+        },
+      ])
     })
 
     test('assign topics with names taken from builtin functions', async () => {

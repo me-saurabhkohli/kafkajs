@@ -4,6 +4,8 @@ const { MemberMetadata, MemberAssignment } = require('../../assignerProtocol')
 
 const DEFAULT_GENERATION = -1
 const CONTESTED = 'CONTESTED'
+const NEEDS_REJOIN = 1
+const DOES_NOT_NEED_REJOIN = 0
 
 const encodeUserData = (generationId, ownedPartitions) =>
   new Encoder()
@@ -37,11 +39,27 @@ const decodeUserData = buffer => {
   }
 }
 
-const safeDecodeMemberMetadata = (memberMetadata, allTopics, version) => {
+const encodeAssignmentUserData = ({ needsRejoin }) =>
+  new Encoder().writeInt8(needsRejoin ? NEEDS_REJOIN : DOES_NOT_NEED_REJOIN).buffer
+
+const decodeAssignmentUserData = buffer => {
+  if (!buffer || buffer.length === 0) {
+    return { needsRejoin: false }
+  }
+
+  try {
+    const decoder = new Decoder(buffer)
+    return { needsRejoin: decoder.readInt8() === NEEDS_REJOIN }
+  } catch (_) {
+    return { needsRejoin: false }
+  }
+}
+
+const safeDecodeMemberMetadata = (memberMetadata, version) => {
   if (!memberMetadata) {
     return {
       version,
-      topics: allTopics,
+      topics: [],
       userData: Buffer.alloc(0),
     }
   }
@@ -51,7 +69,7 @@ const safeDecodeMemberMetadata = (memberMetadata, allTopics, version) => {
   } catch (_) {
     return {
       version,
-      topics: allTopics,
+      topics: [],
       userData: Buffer.alloc(0),
     }
   }
@@ -71,38 +89,41 @@ module.exports = ({ cluster }) => {
   let currentOwnedPartitions = {}
 
   return {
-    name: 'cooperative-sticky',
+    name: 'cooperative-sticky-kafkajs',
     version: 1,
 
-    onAssignment({ assignment, generationId }) {
+    onAssignment({ assignment, generationId, userData }) {
       const hadRevocations =
         currentGenerationId !== DEFAULT_GENERATION &&
         Object.entries(currentOwnedPartitions).some(([topic, parts]) =>
           parts.some(p => !(assignment[topic] || []).includes(p))
         )
 
+      const { needsRejoin } = decodeAssignmentUserData(userData)
+
       currentGenerationId = generationId
       currentOwnedPartitions = assignment
-      return hadRevocations
+      return hadRevocations || needsRejoin
     },
 
-    async assign({ members, topics }) {
+    async assign({ members, topics, allSubscribedTopics }) {
+      const assignableTopics = allSubscribedTopics || topics
       const sortedMembers = members.map(m => m.memberId).sort()
       const memberInfo = {}
 
       for (const { memberId, memberMetadata } of members) {
-        const decoded = safeDecodeMemberMetadata(memberMetadata, topics, this.version)
+        const decoded = safeDecodeMemberMetadata(memberMetadata, this.version)
         const { generationId, ownedPartitions } = decodeUserData(decoded.userData)
 
         memberInfo[memberId] = {
-          subscribedTopics: decoded.topics && decoded.topics.length > 0 ? decoded.topics : topics,
+          subscribedTopics: decoded.topics || [],
           generationId,
           ownedPartitions,
         }
       }
 
       const topicPartitions = {}
-      for (const topic of topics) {
+      for (const topic of assignableTopics) {
         topicPartitions[topic] = cluster
           .findTopicPartitionMetadata(topic)
           .map(m => m.partitionId)
@@ -110,7 +131,7 @@ module.exports = ({ cluster }) => {
       }
 
       const prevOwner = {}
-      for (const topic of topics) {
+      for (const topic of assignableTopics) {
         prevOwner[topic] = {}
       }
 
@@ -145,7 +166,7 @@ module.exports = ({ cluster }) => {
       }
 
       const unassigned = []
-      for (const topic of topics) {
+      for (const topic of assignableTopics) {
         for (const partitionId of topicPartitions[topic]) {
           const owner = prevOwner[topic][partitionId]
           if (
@@ -237,6 +258,18 @@ module.exports = ({ cluster }) => {
             }
           }
         }
+
+        if (!placed) {
+          const eligibleMembers = sortedMembers
+            .filter(memberId => memberInfo[memberId].subscribedTopics.includes(topic))
+            .sort((a, b) => countPartitions(a) - countPartitions(b) || a.localeCompare(b))
+
+          if (eligibleMembers.length > 0) {
+            const candidate = eligibleMembers[0]
+            if (!assignment[candidate][topic]) assignment[candidate][topic] = []
+            assignment[candidate][topic].push(partitionId)
+          }
+        }
       }
 
       const makeKeySet = owned => {
@@ -261,8 +294,11 @@ module.exports = ({ cluster }) => {
         }
       }
 
+      let needsAnotherRound = false
       for (const [key, newOwner] of Object.entries(allAdded)) {
         if (!allRevoked.has(key)) continue
+
+        needsAnotherRound = true
 
         const split = key.indexOf(':')
         const topic = key.slice(0, split)
@@ -284,6 +320,7 @@ module.exports = ({ cluster }) => {
         memberAssignment: MemberAssignment.encode({
           version: this.version,
           assignment: assignment[memberId],
+          userData: encodeAssignmentUserData({ needsRejoin: needsAnotherRound }),
         }),
       }))
     },
@@ -303,3 +340,4 @@ module.exports = ({ cluster }) => {
 
 module.exports.encodeUserData = encodeUserData
 module.exports.decodeUserData = decodeUserData
+module.exports.decodeAssignmentUserData = decodeAssignmentUserData

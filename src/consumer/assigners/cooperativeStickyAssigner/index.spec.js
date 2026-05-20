@@ -1,5 +1,5 @@
 const CooperativeStickyAssigner = require('./index')
-const { encodeUserData, decodeUserData } = require('./index')
+const { encodeUserData, decodeUserData, decodeAssignmentUserData } = require('./index')
 const { MemberAssignment, MemberMetadata } = require('../../assignerProtocol')
 
 const makeCluster = topicCounts => {
@@ -30,11 +30,11 @@ const assignAndDecode = async (assigner, members, topics) => {
 }
 
 describe('Consumer > assigners > CooperativeStickyAssigner', () => {
-  test('protocol name is cooperative-sticky and metadata includes userData', () => {
+  test('protocol name is cooperative-sticky-kafkajs and metadata includes userData', () => {
     const assigner = CooperativeStickyAssigner({ cluster: makeCluster({ A: 1 }) })
     const { name, metadata } = assigner.protocol({ topics: ['A'] })
 
-    expect(name).toBe('cooperative-sticky')
+    expect(name).toBe('cooperative-sticky-kafkajs')
     const decoded = MemberMetadata.decode(metadata)
     expect(decoded.topics).toEqual(['A'])
     expect(decodeUserData(decoded.userData)).toEqual({ generationId: -1, ownedPartitions: {} })
@@ -51,7 +51,9 @@ describe('Consumer > assigners > CooperativeStickyAssigner', () => {
       makeMember('m2', ['A']),
     ]
 
-    await expect(assigner.assign({ members, topics: ['A'] })).resolves.toBeDefined()
+    const assignments = await assignAndDecode(assigner, members, ['A'])
+    expect(assignments.m1).toEqual({})
+    expect((assignments.m2.A || []).sort()).toEqual([0, 1])
   })
 
   test('withholds transferred partitions in first round and completes in second round', async () => {
@@ -84,7 +86,23 @@ describe('Consumer > assigners > CooperativeStickyAssigner', () => {
     expect((round2.c2.A || []).sort()).toEqual([2, 3])
   })
 
-  test('rolling deployment scenario with mixed subscriptions stays stable', async () => {
+  test('marks all members for rejoin when cooperative transfer is withheld', async () => {
+    const cluster = makeCluster({ A: 4 })
+    const assigner = CooperativeStickyAssigner({ cluster })
+
+    const result = await assigner.assign({
+      members: [makeMember('c1', ['A'], { A: [0, 1, 2, 3] }, 1), makeMember('c2', ['A'], {}, -1)],
+      topics: ['A'],
+      allSubscribedTopics: ['A'],
+    })
+
+    for (const { memberAssignment } of result) {
+      const decoded = MemberAssignment.decode(memberAssignment)
+      expect(decodeAssignmentUserData(decoded.userData)).toEqual({ needsRejoin: true })
+    }
+  })
+
+  test('rolling deployment scenario with mixed subscriptions keeps full eligible coverage', async () => {
     const assigner = CooperativeStickyAssigner({ cluster: makeCluster({ A: 2, B: 2 }) })
     const assignment = await assignAndDecode(
       assigner,
@@ -92,11 +110,25 @@ describe('Consumer > assigners > CooperativeStickyAssigner', () => {
       ['A', 'B']
     )
 
-    // no crash, all topics represented by subscribers
-    const total = Object.values(assignment).reduce(
-      (sum, byTopic) => sum + Object.values(byTopic).reduce((s, ps) => s + ps.length, 0),
-      0
-    )
-    expect(total).toBeGreaterThan(0)
+    expect((assignment.old.A || []).sort()).toEqual([0, 1])
+    expect(assignment.old.B || []).toEqual([])
+    expect(assignment.new.A || []).toEqual([])
+    expect((assignment.new.B || []).sort()).toEqual([0, 1])
+
+    const seen = new Set()
+    for (const [memberId, byTopic] of Object.entries(assignment)) {
+      for (const [topic, partitions] of Object.entries(byTopic)) {
+        for (const partition of partitions) {
+          const key = `${topic}:${partition}`
+          expect(seen.has(key)).toBe(false)
+          seen.add(key)
+
+          if (memberId === 'old') {
+            expect(topic).toBe('A')
+          }
+        }
+      }
+    }
+    expect(seen).toEqual(new Set(['A:0', 'A:1', 'B:0', 'B:1']))
   })
 })

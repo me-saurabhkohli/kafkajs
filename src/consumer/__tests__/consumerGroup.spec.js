@@ -94,7 +94,8 @@ describe('ConsumerGroup', () => {
       expect(topicsArg.sort()).toEqual(['topic1', 'topic2'])
       expect(assigner.assign).toHaveBeenCalledWith({
         members: consumerGroup.members,
-        topics: ['topic1', 'topic2'],
+        topics: ['topic1'],
+        allSubscribedTopics: ['topic1', 'topic2'],
       })
     })
 
@@ -191,6 +192,54 @@ describe('ConsumerGroup', () => {
         expect.objectContaining({
           maxCooperativeRejoinRounds: 20,
           requestedBy: ['cooperative-sticky'],
+        })
+      )
+    })
+
+    test('joinAndSync honors configured max cooperative rounds', async () => {
+      consumerGroup = new ConsumerGroup({
+        logger: newLogger(),
+        topics: ['topic1'],
+        cluster: {},
+        groupId: 'group-1',
+        topicConfigurations: {},
+        instrumentationEmitter: { emit: jest.fn() },
+        assigners: [],
+        maxCooperativeRejoinRounds: 2,
+      })
+
+      consumerGroup.subscriptionState = {
+        assigned: () => [],
+      }
+
+      consumerGroup.logger = {
+        info: jest.fn(),
+        warn: jest.fn(),
+        error: jest.fn(),
+      }
+
+      const joinSymbol = getPrivateSymbol(consumerGroup, 'private:ConsumerGroup:join')
+      const syncSymbol = getPrivateSymbol(consumerGroup, 'private:ConsumerGroup:sync')
+
+      consumerGroup[joinSymbol] = jest.fn(async () => {
+        consumerGroup.memberId = 'member-1'
+        consumerGroup.leaderId = 'member-1'
+        consumerGroup.groupProtocol = 'cooperative-sticky-kafkajs'
+      })
+      consumerGroup[syncSymbol] = jest.fn(async () => {
+        consumerGroup.needsCooperativeRejoin = true
+        consumerGroup.cooperativeRejoinRequestedBy = ['cooperative-sticky-kafkajs']
+      })
+
+      await expect(consumerGroup.joinAndSync()).rejects.toThrow(
+        'Exceeded maximum cooperative rejoin rounds (2)'
+      )
+      expect(consumerGroup[joinSymbol]).toHaveBeenCalledTimes(2)
+      expect(consumerGroup[syncSymbol]).toHaveBeenCalledTimes(2)
+      expect(consumerGroup.logger.error).toHaveBeenCalledWith(
+        'Exceeded cooperative rejoin round limit',
+        expect.objectContaining({
+          maxCooperativeRejoinRounds: 2,
         })
       )
     })

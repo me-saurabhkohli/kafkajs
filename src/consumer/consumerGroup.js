@@ -62,6 +62,7 @@ module.exports = class ConsumerGroup {
    * @param {number} options.isolationLevel
    * @param {string} options.rackId
    * @param {number} options.metadataMaxAge
+   * @param {number} [options.maxCooperativeRejoinRounds]
    */
   constructor({
     retry,
@@ -84,6 +85,7 @@ module.exports = class ConsumerGroup {
     isolationLevel,
     rackId,
     metadataMaxAge,
+    maxCooperativeRejoinRounds = MAX_COOPERATIVE_REJOIN_ROUNDS,
   }) {
     /** @type {import("../../types").Cluster} */
     this.cluster = cluster
@@ -107,6 +109,7 @@ module.exports = class ConsumerGroup {
     this.isolationLevel = isolationLevel
     this.rackId = rackId
     this.metadataMaxAge = metadataMaxAge
+    this.maxCooperativeRejoinRounds = maxCooperativeRejoinRounds
 
     this.seekOffset = new SeekOffsets()
     this.coordinator = null
@@ -241,7 +244,11 @@ module.exports = class ConsumerGroup {
 
       await this.cluster.addMultipleTargetTopics(allTopics)
       await this.cluster.refreshMetadata()
-      assignment = await assigner.assign({ members, topics: allTopics })
+      assignment = await assigner.assign({
+        members,
+        topics: topicsSubscribed,
+        allSubscribedTopics: allTopics,
+      })
 
       this.logger.debug('Group assignment', {
         groupId,
@@ -338,11 +345,17 @@ module.exports = class ConsumerGroup {
       (acc, { topic, partitions }) => ({ ...acc, [topic]: partitions }),
       {}
     )
+    const assignerName = this.groupProtocol
     for (const assigner of this.assigners) {
+      if (assignerName && assigner.name !== assignerName) {
+        continue
+      }
+
       if (typeof assigner.onAssignment === 'function') {
         const shouldRejoin = assigner.onAssignment({
           assignment: assignmentMap,
           generationId: this.generationId,
+          userData: decodedMemberAssignment.userData,
         })
         if (shouldRejoin) {
           this.needsCooperativeRejoin = true
@@ -380,9 +393,9 @@ module.exports = class ConsumerGroup {
       while (true) {
         cooperativeRejoinRound += 1
 
-        if (cooperativeRejoinRound > MAX_COOPERATIVE_REJOIN_ROUNDS) {
+        if (cooperativeRejoinRound > this.maxCooperativeRejoinRounds) {
           const error = new KafkaJSNonRetriableError(
-            `Exceeded maximum cooperative rejoin rounds (${MAX_COOPERATIVE_REJOIN_ROUNDS})`
+            `Exceeded maximum cooperative rejoin rounds (${this.maxCooperativeRejoinRounds})`
           )
 
           this.logger.error('Exceeded cooperative rejoin round limit', {
@@ -391,7 +404,7 @@ module.exports = class ConsumerGroup {
             leaderId: this.leaderId,
             groupProtocol: this.groupProtocol,
             cooperativeRejoinRound,
-            maxCooperativeRejoinRounds: MAX_COOPERATIVE_REJOIN_ROUNDS,
+            maxCooperativeRejoinRounds: this.maxCooperativeRejoinRounds,
             requestedBy: this.cooperativeRejoinRequestedBy,
           })
 
@@ -450,7 +463,7 @@ module.exports = class ConsumerGroup {
           leaderId: this.leaderId,
           groupProtocol: this.groupProtocol,
           cooperativeRejoinRound,
-          maxCooperativeRejoinRounds: MAX_COOPERATIVE_REJOIN_ROUNDS,
+          maxCooperativeRejoinRounds: this.maxCooperativeRejoinRounds,
           requestedBy: this.cooperativeRejoinRequestedBy,
         })
       }
